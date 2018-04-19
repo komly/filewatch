@@ -64,24 +64,52 @@ LOOP:
 	cb()
 }
 
-func watchForChanges(files []string) chan fsnotify.Event {
-	fileMap := make(map[string]struct{})
-	for _, f := range files {
-		fileMap[f] = struct{}{}
-	}
-
+func watchForChanges(patterns []string, dirPatterns []string) chan fsnotify.Event {
 	events := make(chan fsnotify.Event)
 
 	go func() {
 		for {
 			select {
 			case event := <-watch.Events:
-				if _, ok := fileMap[event.Name]; ok {
-					if event.Op == fsnotify.Chmod {
-						continue
-					}
-					events <- event
-				}
+                absName, err := filepath.Abs(event.Name)
+                if err != nil {
+                    log.Fatalf("can't get abs path for event: %s %s", event.Name, err)
+                }
+                if event.Op & fsnotify.Create == fsnotify.Create {
+                    for _, pattern := range dirPatterns {
+                            stat, err := os.Stat(absName)
+                            if err != nil {
+                                log.Printf("can't get stat for file: %s, %s", absName, err)
+                            }
+                            if stat.IsDir() {
+                                ok, err := zglob.Match(pattern, absName)
+                                if err != nil {
+                                    log.Fatalf("can't match name: %s", err)
+                                }
+                                if ok {
+                                    addFilesToWatch([]string{absName})
+                                }
+                            }
+                    }
+                }
+                for _, pattern := range patterns {
+                    ok, err := zglob.Match(pattern, absName)
+                    if err != nil {
+                        log.Fatalf("can't match name: %s", err)
+                    }
+                    if *verbose {
+                        log.Printf("will match: %s %s res: %v", pattern, absName, ok)
+                    }
+                    if ok {
+                        if event.Op == fsnotify.Chmod {
+                            continue
+                        }
+                        if *verbose {
+                            log.Printf("event: %+v", event.Name)
+                        }
+                        events <- event
+                    }
+                }
 			case err := <-watch.Errors:
 				if err != nil {
 					log.Fatalf("watch error: %s", err)
@@ -148,36 +176,47 @@ func main() {
 	}
 	defer watch.Close()
 
+
 	files := make([]string, 0)
 
-	parts := strings.Split(*fileNames, ",")
-	for _, part := range parts {
-		matches, err := zglob.Glob(part)
-		if err != nil {
-			log.Fatalf("invalid pattern: %s %s", part, err)
-		}
-		for _, f := range matches {
-			if *verbose {
-				log.Printf("watching for: %s", f)
-			}
-			f, err := filepath.Abs(f)
-			if err != nil {
-				log.Fatalf("can't get absolute path for file: %s", f)
-			}
-			files = append(files, f)
-		}
-	}
+	patterns := strings.Split(*fileNames, ",")
+    for i, p := range patterns {
+        absPattern, err := filepath.Abs(p)
+        if err != nil {
+            log.Fatalf("can't get absolute path for pattern: %s %s", p, err)
+        }
+        patterns[i] =  absPattern
+    }
 
-	if len(files) == 0 {
-		flag.PrintDefaults()
-		os.Exit(2)
-	}
+    dirPatterns := make([]string, 0)
+	for _, pattern := range patterns {
+        parent := strings.SplitN(pattern, "*", 2)
+        if parent[0] != pattern {
+            dirPatterns = append(dirPatterns, parent[0])
+            dirPatterns = append(dirPatterns, parent[0] + "**/*")
+        } else {
+            dirPatterns = append(dirPatterns, pattern)
+        }
+    }
+
+	for _, pattern := range dirPatterns {
+        matches, err := zglob.Glob(pattern)
+        if err != nil {
+            log.Fatalf("can't glob pattern: %s %s", pattern, err)
+        }
+        for _, match := range matches {
+            files = append(files, match)
+        }
+    }
+    if *verbose {
+        log.Printf("watching for files: %+v", files)
+    }
 
 	if err := addFilesToWatch(files); err != nil {
 		log.Fatal(err)
 	}
 
-	events := watchForChanges(files)
+	events := watchForChanges(patterns, dirPatterns)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
